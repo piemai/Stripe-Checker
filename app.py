@@ -8,6 +8,7 @@ import os
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites CC Checker (Astra + Rollerco)", version="6.1.0")
+app = FastAPI(title="Rotating Sites CC Checker (Astra + Rollerco)", version="6.2.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -116,6 +117,18 @@ def universal_card_formatter(raw_line: str) -> tuple[str, str, str, str] | None:
     clean = raw_line.strip()
     if not clean or clean.startswith("#"):
         return None
+    
+    parts = [p.strip() for p in re.split(r"[|:/\\\s-]+", clean) if p.strip()]
+    if len(parts) >= 4:
+        cc = parts[0]
+        mm = parts[1].zfill(2)
+        yy = parts[2]
+        cvv = parts[3]
+        yy = yy if len(yy) == 4 else "20" + yy[-2:]
+        if cc.isdigit() and mm.isdigit() and yy.isdigit() and cvv.isdigit():
+            if verify_luhn(cc) and (1 <= int(mm) <= 12):
+                return cc, mm, yy[-2:], cvv
+
     numbers = re.findall(r"\d+", clean)
     if not numbers:
         return None
@@ -125,22 +138,12 @@ def universal_card_formatter(raw_line: str) -> tuple[str, str, str, str] | None:
     if match:
         cc = match.group("cc")
         mm = match.group("mm")
-        yy = match.group("yy")
+        yy = match.group("yy")[-2:]
         cvv = match.group("cvv")
-    else:
-        parts = re.split(r"[|:/\\\s-]+", clean)
-        filtered = [p for p in parts if p.isdigit()]
-        if len(filtered) < 4:
-            return None
-        cc = filtered[0]
-        mm = filtered[1].zfill(2)
-        yy = filtered[2]
-        cvv = filtered[3]
+        if verify_luhn(cc) and (1 <= int(mm) <= 12):
+            return cc, mm, yy, cvv
 
-    if not verify_luhn(cc) or not (1 <= int(mm) <= 12):
-        return None
-    short_yy = yy[-2:] if len(yy) == 4 else yy
-    return cc, mm, short_yy, cvv
+    return None
 
 
 def is_card_expired(mm: str, yy: str) -> bool:

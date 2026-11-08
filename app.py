@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.2.0")
+app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.3.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -164,12 +164,18 @@ def parse_proxy_string(proxy_url: str | None) -> dict[str, str] | None:
     if not proxy_url or not proxy_url.strip():
         return None
     raw = proxy_url.strip()
-    parts = raw.split(":")
-    if len(parts) == 4 and "://" not in raw:
-        host, port, user, pw = parts
-        formatted = f"http://{user}:{pw}@{host}:{port}"
+    
+    # Inaayos ang parsing para sa https:// o http:// URL formats ng Thordata
+    if "://" in raw:
+        formatted = re.sub(r'^(https?|socks5):\/\/', 'http://', raw)
     else:
-        formatted = raw if "://" in raw else f"http://{raw}"
+        parts = raw.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            formatted = f"http://{user}:{pw}@{host}:{port}"
+        else:
+            formatted = f"http://{raw}"
+            
     return {"http": formatted, "https": formatted}
 
 
@@ -602,7 +608,7 @@ async def index() -> str:
                             Test & Auto-Prune (Drop Dead)
                         </button>
                     </div>
-                    <textarea id="proxyInput" rows="4" placeholder="host:port:user:pass"
+                    <textarea id="proxyInput" rows="4" placeholder="https://user:pass@host:port"
                         class="w-full bg-slate-950 border border-emerald-900/50 rounded-lg p-3 text-xs font-mono focus:outline-none text-emerald-300"></textarea>
                 </div>
                 <div class="space-y-2">

